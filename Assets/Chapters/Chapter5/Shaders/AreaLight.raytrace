@@ -1,0 +1,73 @@
+#include "RTCommon.hlsl"
+#include "Random.hlsl"
+#pragma max_recursion_depth 1
+#pragma enable_ray_tracing_shader_debug_symbols
+RaytracingAccelerationStructure g_SceneAS;
+RWTexture2D<float4> g_Output;
+RWTexture2D<float4> g_Accum;
+int g_FrameCount;
+
+float3 raygenMainCommon(uint2 launchIndex, uint2 launchDim, uint seed){
+    initRandom(seed);
+    float2 frameCoord    = float2(launchIndex)+float2(0.5,0.5);
+    float3 color         = float3(0.0,0.0,0.0);
+    float2 frameOffset   = Random2f()-float2(0.5,0.5);
+    RayDesc ray          = GenerateRay(frameCoord+frameOffset, float2 (launchDim.x,launchDim.y));
+    RayPayloadData payload;
+    payload.lightColor   = float3(0,0,0);
+    TraceRay(g_SceneAS, 0, 0xFF, 0, 1, 0, ray, payload);
+    color += payload.lightColor;
+    do {
+    if (payload.isDone){break;}
+    float3 illumColor = float3(0,0,0);
+    // 一次照明
+    float3   diffuseColor = payload.diffuseColor;
+    float3   normal       = payload.hitNormal;
+    float4   tangent      = payload.hitTangent;
+    float3   binormal     = cross(normal, tangent.xyz)*tangent.w;
+    float3x3 TBN          = float3x3(tangent.xyz, binormal, normal);
+    float3   origin       = payload.hitPoint+ 0.001*normal;
+    [loop]
+    for (int j = 0;j<16;++j){
+        float2 randomUV = Random2f();
+        float3 localWi  = uniformHemiSphere(randomUV);
+        // 接空間の方向ベクトルへ変換
+        float3 worldWi      = normalize(mul(localWi,TBN));
+        ray.Origin          = origin;
+        ray.Direction       = worldWi;
+        ray.TMax            = 1000.0;
+        TraceRay(g_SceneAS, 0, 0xFF, 0, 1, 0, ray, payload);
+        illumColor += diffuseColor*payload.lightColor * localWi.z * 2.0;
+    }
+    illumColor /= 16.0;
+    color += illumColor;
+    } while (0);
+    return color;
+}
+
+[shader("raygeneration")]
+void raygenMainTemp(){
+    uint2  launchIndex = DispatchRaysIndex().xy;
+    uint2  launchDim   = DispatchRaysDimensions().xy;
+    uint   seed = launchDim.x * launchIndex.y * launchIndex.x;
+    float3 color =  raygenMainCommon(launchIndex,launchDim,seed);
+    g_Output[launchIndex] = float4(color,1.0);
+}
+[shader("raygeneration")]
+void raygenMainAccum(){
+    uint2  launchIndex = DispatchRaysIndex().xy;
+    uint2  launchDim   = DispatchRaysDimensions().xy;
+    uint   seed  = g_FrameCount * launchDim.x * launchDim.y + launchDim.x * launchIndex.y * launchIndex.x;
+    float3 color =  raygenMainCommon(launchIndex,launchDim,seed);
+    float3 accumColor = color;
+    if (g_FrameCount != 0){accumColor += g_Accum[launchIndex].xyz;}
+    g_Accum[launchIndex]  = float4(accumColor,1.0);
+    color = accumColor / float(g_FrameCount+1);
+    g_Output[launchIndex] = float4(color,1.0);
+}
+[shader("miss")]
+void missMain(inout RayPayloadData payload: SV_RayPayload){ 
+    payload.lightColor = float3(0, 0, 0);
+    payload.diffuseColor = float3(0,0,0);
+    payload.isDone     = true;
+}

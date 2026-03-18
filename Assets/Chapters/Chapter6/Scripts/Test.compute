@@ -1,0 +1,15 @@
+#pragma kernel CSMain
+
+RWTexture2D<float4> Tex;
+StructuredBuffer<float4> Buff;
+
+[numthreads(8, 8, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint length, stride;
+    Buff.GetDimensions(length, stride);
+    
+    uint offset = id.y % length;
+    uint idx = id.x + id.y * 8 + offset;
+    Tex[id.xy] = 0.75f * Buff[idx % length];
+}

@@ -1,0 +1,11 @@
+#pragma max_recursion_depth 1
+#pragma enable_ray_tracing_shader_debug_symbols
+RWTexture2D<float4> g_Output;
+[shader("raygeneration")]
+void raygenMain()
+{
+	uint2 launchIndex = DispatchRaysIndex().xy;
+	uint2 launchDim = DispatchRaysDimensions().xy;
+	float2 uv = float2(launchIndex) / float2(launchDim);
+	g_Output[launchIndex] = float4( uv, 0, 1);
+}

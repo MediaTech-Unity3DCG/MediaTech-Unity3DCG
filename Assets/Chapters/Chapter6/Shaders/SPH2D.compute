@@ -1,0 +1,221 @@
+#pragma kernel init_cs
+#pragma kernel property_cs
+#pragma kernel force_cs
+#pragma kernel integrate_cs
+
+#define THREAD_SIZE_X 256
+#define PI 3.14159265
+#define U_INT_TO_DOUBLE01 (1.0 / 4294967296.0)
+
+#include "./ParticleStruct.hlsl"
+
+RWStructuredBuffer<Particle> _ParticlesBuffer;
+
+cbuffer CBuffer
+{
+    uint _RandSeed;
+    float2 _InitRange;
+    float _RandUnitRadius;
+    
+    uint _NumParticles;
+    float _TimeStep;
+    float _SmoothLen;
+    float _PressureStiffness;
+    float _RestDensity;
+    float _DensityCoe;
+    float _GradPressureCoe;
+    float _LapViscosityCoe;
+    float _WallStiffness;
+    float _Viscosity;
+    float2 _Gravity;
+    float2 _Range;
+}
+
+/// Poly6 Kernel
+inline float calculate_density(float r_sq)
+{
+    const float h_sq = _SmoothLen * _SmoothLen;
+    return _DensityCoe * (h_sq - r_sq) * (h_sq - r_sq) * (h_sq - r_sq);
+}
+
+/// Tait
+inline float calculate_pressure(float density)
+{
+    return _PressureStiffness * max(pow(abs(density / _RestDensity), 7) - 1.0f, 0.0f);
+}
+
+/// Spiky Kernel
+inline float2 calculate_grad_pressure(float r, float pressure1, float pressure2, float density, float2 diff)
+{
+    const float h = _SmoothLen;
+    const float pressure_avg = 0.5f * (pressure2 + pressure1);
+    return _GradPressureCoe * pressure_avg / density * (h - r) * (h - r) / r * diff;
+}
+
+/// Viscosity Kernel
+inline float2 calculate_lap_velocity(float r, float2 velocity1, float2 velocity2, float density)
+{
+    const float h = _SmoothLen;
+    const float2 diff = velocity2 - velocity1;
+    return _LapViscosityCoe / density * (h - r) * diff;
+}
+
+uint pcg_hash(uint input)
+{
+    const uint state = input * 747796405u + 2891336453u;
+    const uint word = (state >> ((state >> 28u) + 4u) ^ state) * 277803737u;
+    return word >> 22u ^ word;
+}
+
+[numthreads(THREAD_SIZE_X, 1, 1)]
+void init_cs(uint3 tid : SV_DispatchThreadID, uint gid : SV_GroupIndex)
+{
+    const uint id = tid.x;
+    if (_NumParticles <= id)
+    {
+        return;
+    }
+
+    const float r = pcg_hash(id + _RandSeed) * U_INT_TO_DOUBLE01;
+    const float theta = pcg_hash(gid + _RandSeed) * U_INT_TO_DOUBLE01;
+
+    const float x = r * _RandUnitRadius * cos(2.0f * PI * theta);
+    const float y = r * _RandUnitRadius * sin(2.0f * PI * theta);
+
+    Particle p;
+    p.position = _InitRange + float2(x, y);
+    p.acceleration = float2(0.0f, 0.0f);
+    p.velocity = float2(0.0f, 0.0f);
+    p.density = 0.0f;
+    p.pressure = 0.0f;
+
+    _ParticlesBuffer[id] = p;
+}
+
+[numthreads(THREAD_SIZE_X, 1, 1)]
+void property_cs(uint3 tid : SV_DispatchThreadID)
+{
+    const uint id = tid.x;
+    if (_NumParticles <= id)
+    {
+        return;
+    }
+
+    Particle p = _ParticlesBuffer[id];
+
+    const float h_sq = _SmoothLen * _SmoothLen;
+    const float2 pos = p.position;
+
+    float density = 0;
+    for (uint i = 0; i < _NumParticles; i++)
+    {
+        if (i == id)
+        {
+            continue;
+        }
+
+        const float2 pos2 = _ParticlesBuffer[i].position;
+
+        const float2 diff = pos2 - pos;
+        const float r_sq = dot(diff, diff);
+        if (r_sq < h_sq)
+        {
+            density += calculate_density(r_sq);
+        }
+    }
+
+    density = max(density, _RestDensity);
+    p.density = density;
+    p.pressure = calculate_pressure(density);
+
+    _ParticlesBuffer[id] = p;
+}
+
+[numthreads(THREAD_SIZE_X, 1, 1)]
+void force_cs(uint3 tid : SV_DispatchThreadID)
+{
+    const uint id = tid.x;
+    if (_NumParticles <= id)
+    {
+        return;
+    }
+
+    Particle p1 = _ParticlesBuffer[id];
+
+    const float h_sq = _SmoothLen * _SmoothLen;
+    float2 press = float2(0.0f, 0.0f);
+    float2 visco = float2(0.0f, 0.0f);
+    for (uint i = 0; i < _NumParticles; i++)
+    {
+        if (i == id)
+        {
+            continue;
+        }
+
+        Particle p2 = _ParticlesBuffer[i];
+        const float2 diff = p2.position - p1.position;
+        const float r_sq = dot(diff, diff);
+
+        if (r_sq < h_sq)
+        {
+            const float r = sqrt(r_sq);
+            press += calculate_grad_pressure(r, p1.pressure, p2.pressure, p2.density, diff);
+            visco += calculate_lap_velocity(r, p1.velocity, p2.velocity, p2.density);
+        }
+    }
+
+    const float2 force = press + _Viscosity * visco;
+    p1.acceleration = force / p1.density;
+
+    _ParticlesBuffer[id] = p1;
+}
+
+[numthreads(THREAD_SIZE_X, 1, 1)]
+void integrate_cs(uint3 tid : SV_DispatchThreadID)
+{
+    const uint id = tid.x;
+    if (_NumParticles <= id)
+    {
+        return;
+    }
+
+    Particle p = _ParticlesBuffer[id];
+    float2 position = _ParticlesBuffer[id].position;
+    float2 velocity = _ParticlesBuffer[id].velocity;
+    float2 acceleration = p.acceleration;
+
+    acceleration += _Gravity;
+
+    if (position.x < 0.0f)
+    {
+        position.x = 5e-4f;
+        velocity.x = 0.0f;
+        acceleration.x += _WallStiffness;
+    }
+    else if (position.x > _Range.x)
+    {
+        position.x = _Range.x - 5e-4f;
+        velocity.x = 0.0f;
+        acceleration.x += -_WallStiffness;
+    }
+    if (position.y < 0.0f)
+    {
+        position.y = 5e-4f;
+        velocity.y = 0.0f;
+        acceleration.y += _WallStiffness;
+    }
+    else if (position.y > _Range.y)
+    {
+        position.y = _Range.y - 5e-4f;
+        velocity.y = 0.0f;
+        acceleration.y += -_WallStiffness;
+    }
+
+    velocity += _TimeStep * acceleration;
+    position += _TimeStep * velocity;
+
+    p.position = position;
+    p.velocity = velocity;
+
+    _ParticlesBuffer[id] = p;
+}

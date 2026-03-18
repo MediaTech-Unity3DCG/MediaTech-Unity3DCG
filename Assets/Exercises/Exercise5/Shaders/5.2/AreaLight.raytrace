@@ -1,0 +1,102 @@
+#include "RTCommon.hlsl"
+#include "Random.hlsl"
+#pragma max_recursion_depth 1
+#pragma enable_ray_tracing_shader_debug_symbols
+RaytracingAccelerationStructure g_SceneAS;
+RWTexture2D<float4> g_Output;
+RWTexture2D<float4> g_Accum;
+int g_FrameCount;
+struct PathVertex {
+    float3 position;
+    float3 diffuseColor;
+    float3x3 TBN;
+};
+PathVertex makePathVertex(RayPayloadData payload){
+    PathVertex vertex;
+    vertex.position	 = payload.hitPoint + 0.001*payload.hitNormal;
+    vertex.diffuseColor = payload.diffuseColor;
+    vertex.TBN[0] = normalize(payload.hitTangent.xyz);
+    vertex.TBN[2] = normalize(payload.hitNormal);
+    vertex.TBN[1] = cross(vertex.TBN[2], vertex.TBN[0]) * payload.hitTangent.w;
+    return vertex;
+}
+
+float3 raygenMainCommon(uint2 launchIndex, uint2 launchDim, uint seed){
+    initRandom(seed);
+    float2 frameCoord    = float2(launchIndex)+float2(0.5,0.5);
+    float3 color         = float3(0.0,0.0,0.0);
+    float2 frameOffset   = Random2f()-float2(0.5,0.5);
+    // 一次レイの生成
+    RayDesc ray = GenerateRay(frameCoord+frameOffset, float2 (launchDim.x,launchDim.y));
+    RayPayloadData payload;
+    payload.lightColor   = float3(0,0,0);
+    TraceRay(g_SceneAS, 0, 0xFF, 0, 1, 0, ray, payload);
+    // 一次レイの反射点
+    PathVertex primaryVertex = makePathVertex(payload);
+    // 発光成分の加算
+    color += payload.lightColor;
+    do {
+    if (payload.isDone){break;}
+    float3 illumColor = float3(0,0,0);
+    [loop]
+    for (int j = 0;j<16;++j){
+        float3 throughput = float3(1,1,1);
+        // 二次レイの生成
+        float2 randomUV = Random2f();
+        float3 localWi = uniformHemiSphere(randomUV);
+        float3 worldWi = normalize(mul(localWi,primaryVertex.TBN));
+        ray.Origin = primaryVertex.position;
+        ray.Direction = worldWi;
+        ray.TMax = 1000.0;
+        TraceRay(g_SceneAS, 0, 0xFF, 0, 1, 0, ray, payload);
+        // スループットの更新（直接照明）
+        throughput *= primaryVertex.diffuseColor*localWi.z * 2.0;
+        illumColor += throughput* payload.lightColor;
+        if (payload.isDone){continue;}
+        // 二次レイの反射点
+        PathVertex secondaryVertex = makePathVertex(payload);
+        // 三次レイの生成
+        float2 randomUV2 = Random2f();
+        float3 localWi2  = uniformHemiSphere(randomUV2);
+        float3 worldWi2  = normalize(mul(localWi2,secondaryVertex.TBN));
+        ray.Origin = secondaryVertex.position;
+        ray.Direction = worldWi2;
+        ray.TMax = 1000.0;
+        TraceRay(g_SceneAS, 0, 0xFF, 0, 1, 0, ray, payload);
+        // スループットの更新（間接照明）
+        throughput *= secondaryVertex.diffuseColor*localWi2.z*2.0;
+        illumColor += throughput* payload.lightColor;
+    }
+    illumColor /= 16.0;
+    color += illumColor;
+    } while (0);
+    return color;
+}
+
+[shader("raygeneration")]
+void raygenMainTemp(){
+    uint2  launchIndex = DispatchRaysIndex().xy;
+    uint2  launchDim   = DispatchRaysDimensions().xy;
+    uint   seed = launchDim.x * launchIndex.y * launchIndex.x;
+    float3 color =  raygenMainCommon(launchIndex,launchDim,seed);
+    g_Output[launchIndex] = float4(color,1.0);
+}
+[shader("raygeneration")]
+void raygenMainAccum(){
+    uint2  launchIndex = DispatchRaysIndex().xy;
+    uint2  launchDim   = DispatchRaysDimensions().xy;
+    uint   seed  = g_FrameCount * launchDim.x * launchDim.y + launchDim.x * launchIndex.y * launchIndex.x;
+    float3 color =  raygenMainCommon(launchIndex,launchDim,seed);
+    float3 accumColor = color;
+    if (g_FrameCount != 0){accumColor += g_Accum[launchIndex].xyz;}
+    g_Accum[launchIndex]  = float4(accumColor,1.0);
+    color = accumColor / float(g_FrameCount+1);
+    g_Output[launchIndex] = float4(color,1.0);
+}
+[shader("miss")]
+void missMain(inout RayPayloadData payload: SV_RayPayload){ 
+    payload.hitPoint = float3(0,0,1);
+    payload.lightColor = float3(0, 0, 0);
+    payload.diffuseColor = float3(0,0,0);
+    payload.isDone = true;
+}

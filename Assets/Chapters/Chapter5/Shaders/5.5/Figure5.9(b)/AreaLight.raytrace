@@ -1,0 +1,22 @@
+#include "RTCommon.hlsl"
+#pragma max_recursion_depth 1
+#pragma enable_ray_tracing_shader_debug_symbols
+RaytracingAccelerationStructure g_SceneAS;
+RWTexture2D<float4> g_Output;
+[shader("raygeneration")]
+void raygenMain()
+{
+	uint2 launchIndex = DispatchRaysIndex().xy;
+	uint2 launchDim = DispatchRaysDimensions().xy;
+	float2 frameCoord = float2(launchIndex.x,launchIndex.y);
+	RayDesc ray=GenerateRay(frameCoord,float2(launchDim));
+	RayPayloadData payload;
+	payload.color = float3(0,0,0);
+	TraceRay(g_SceneAS, 0, 0xFF, 0, 1, 0, ray, payload);
+	float4 color = float4(payload.color,1.0);
+	g_Output[launchIndex] = color;
+}
+[shader("miss")]
+void missMain(inout RayPayloadData payload : SV_RayPayload){
+	payload.color = float3(0,0,1);
+}
